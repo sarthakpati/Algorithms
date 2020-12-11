@@ -223,11 +223,6 @@ class TumorSegmentationDataset(Dataset):
             sample = {'features': self.normalize_by_channel(feature_array), 'gt' : label_array}
         elif self.use_case == "inference":
             original_input_shape = list(feature_array.shape)
-            feature_array_normalized = self.normalize_by_channel(feature_array)
-
-            ## no need for zero-padding for patch-based inference
-            # feature_array = self.zero_pad(feature_array)
-            
             # normalize features
             sample = {'features': self.normalize_by_channel(feature_array), 'metadata':  {"dir_path": dir_path, 
                                                                                           "original_x_dim": original_input_shape[1], 
