@@ -11,9 +11,6 @@
 # WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 # This is a 3-clause BSD license as defined in https://opensource.org/licenses/BSD-3-Clause
 
-import os
-os.environ['TORCHIO_HIDE_CITATION_PROMPT'] = '1' # hides torchio citation request, see https://github.com/fepegar/torchio/issues/235
-
 import numpy as np
 import pandas as pd
 import os
@@ -27,8 +24,6 @@ from torch.autograd import Variable
 
 from batchgenerators.augmentations.spatial_transformations import augment_rot90, augment_mirroring
 from batchgenerators.augmentations.noise_augmentations import augment_gaussian_noise
-
-import torchio
 
 def completely_replace_entries(array, old_to_new):
     new_array = array.copy()
@@ -229,25 +224,6 @@ class TumorSegmentationDataset(Dataset):
         elif self.use_case == "inference":
             original_input_shape = list(feature_array.shape)
             feature_array_normalized = self.normalize_by_channel(feature_array)
-
-            # patch-based inference
-            subject_dict = {}
-            for i in range(0, original_input_shape[0]): # unsure about the range
-                subject_dict[str(i)] = feature_array_normalized[i]
-            
-            grid_sampler = torchio.inference.GridSampler(torchio.Subject(subject_dict), self.psize)
-            patch_loader = torch.utils.data.DataLoader(grid_sampler, batch_size=1)
-            aggregator = torchio.inference.GridAggregator(grid_sampler)
-
-            for patches_batch in patch_loader:
-                image = torch.cat([patches_batch[str(i)][torchio.DATA] for i in range(0, original_input_shape[0])], dim=1).cuda()
-                locations = patches_batch[torchio.LOCATION]
-                image = image.float().to(device) # this should happen where "device" is defined
-                pred_mask = model(image) # this should happen where "model" is defined
-                aggregator.add_batch(pred_mask, locations)
-            pred_mask = aggregator.get_output_tensor() # this is the final mask
-            # patch-based inference
-
 
             ## no need for zero-padding for patch-based inference
             # feature_array = self.zero_pad(feature_array)
