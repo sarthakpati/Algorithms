@@ -11,9 +11,14 @@
 # WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 # This is a 3-clause BSD license as defined in https://opensource.org/licenses/BSD-3-Clause
 
+import os
+os.environ['TORCHIO_HIDE_CITATION_PROMPT'] = '1' # hides torchio citation request, see https://github.com/fepegar/torchio/issues/235
+
 import torch.nn.functional as F
 import torch.nn as nn
 import torch
+
+import torchio
 
 from fets.models.pytorch.brainmage.seg_modules import in_conv, DownsamplingModule, EncodingModule, InceptionModule, ResNetModule
 from fets.models.pytorch.brainmage.seg_modules import UpsamplingModule, DecodingModule,IncDownsamplingModule,IncConv
@@ -82,3 +87,25 @@ class PyTorch3DResUNet(BrainMaGeModel):
         x = self.us_0(x)
         x = self.out(x, x1)
         return x
+
+    def run_inference_and_get_image(self, x):
+        # 'x' is the input tensor, which is the normalized feature array
+        # patch-based inference
+        subject_dict = {}
+        for i in range(0, x.shape[0]): # unsure about the range
+            subject_dict[str(i)] = x[i]
+        
+        grid_sampler = torchio.inference.GridSampler(torchio.Subject(subject_dict), self.psize)
+        patch_loader = torch.utils.data.DataLoader(grid_sampler, batch_size=1)
+        aggregator = torchio.inference.GridAggregator(grid_sampler)
+
+        for patches_batch in patch_loader:
+            image = torch.cat([patches_batch[str(i)][torchio.DATA] for i in range(0, x.shape[0])], dim=1).cuda()
+            locations = patches_batch[torchio.LOCATION]
+            image = image.float().to(device) # this should happen where "device" is defined
+            pred_mask = model(image) # this should happen where "model" is defined
+            aggregator.add_batch(pred_mask, locations)
+        pred_mask = aggregator.get_output_tensor() # this is the final mask
+        # patch-based inference
+
+        return pred_mask
