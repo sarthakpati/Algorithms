@@ -100,10 +100,11 @@ class PyTorch3DResUNet(BrainMaGeModel):
         aggregator = torchio.inference.GridAggregator(grid_sampler)
 
         for patches_batch in patch_loader:
+            # concatenate the different modalities into a tensor
             image = torch.cat([patches_batch[str(i)][torchio.DATA] for i in range(0, x.shape[1])], dim=1)
-            locations = patches_batch[torchio.LOCATION]
-            image = image.float().to(device) # this should happen where "device" is defined
-            pred_mask = model(image) # this should happen where "model" is defined
+            locations = patches_batch[torchio.LOCATION] # get location of patch
+            image = image.float().to(self.device) # this should happen where "device" is defined
+            pred_mask = self(image) # this should happen where "model" is defined
             aggregator.add_batch(pred_mask, locations)
         pred_mask = aggregator.get_output_tensor() # this is the final mask
         # patch-based inference
