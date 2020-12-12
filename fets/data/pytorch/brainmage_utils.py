@@ -188,7 +188,7 @@ class TumorSegmentationDataset(Dataset):
             feature_stack.append(mode_array) 
         feature_array = np.stack(feature_stack)
 
-        if self.use_case in ["training", "validation"]:
+        if self.use_case == "training":
             # get label array
             label_image = None
             for label_tag in self.label_tags:
@@ -220,6 +220,19 @@ class TumorSegmentationDataset(Dataset):
             if self.use_case == "training":
                 feature_array, label_array = self.transform(img=feature_array, gt=label_array, img_dim=len(self.feature_modes))
             # normalize features
+            sample = {'features': self.normalize_by_channel(feature_array), 'gt' : label_array}
+        elif self.use_case == "validation":
+            # get label array
+            label_image = None
+            for label_tag in self.label_tags:
+                fpath = find_file_or_with_extension(os.path.join(dir_path, fname + label_tag))
+                if fpath is not None:
+                    label_image = sitk.ReadImage(fpath)
+                    break
+            if label_image == None:
+                raise RuntimeError("Data sample directory (used for train or val) missing any label with provided tags.")
+            label_array = sitk.GetArrayFromImage(label_image)
+            
             sample = {'features': self.normalize_by_channel(feature_array), 'gt' : label_array}
         elif self.use_case == "inference":
             original_input_shape = list(feature_array.shape)
