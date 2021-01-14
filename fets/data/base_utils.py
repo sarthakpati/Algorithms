@@ -8,8 +8,8 @@ def get_appropriate_file_paths_from_subject_dir(dir_path):
 
     returnDict = {}
 
-    brats_modalities = ['T1CE', 'T1', 'T1', 'FLAIR']
-    for mod in returnDict:
+    brats_modalities = ['T1CE', 'T1', 'T2', 'FLAIR']
+    for mod in brats_modalities:
       returnDict[mod] = None
 
     # get the input image files and ground truth
