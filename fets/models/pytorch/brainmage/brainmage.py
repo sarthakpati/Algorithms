@@ -11,6 +11,9 @@
 # WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 # This is a 3-clause BSD license as defined in https://opensource.org/licenses/BSD-3-Clause
 
+import os
+os.environ['TORCHIO_HIDE_CITATION_PROMPT'] = '1' # hides torchio citation request, see https://github.com/fepegar/torchio/issues/235
+import torchio
 
 import numpy as np
 import time
@@ -22,6 +25,7 @@ from itertools import product
 
 import pandas as pd
 import random
+from copy import deepcopy
 
 import torchio
 import torch
@@ -32,7 +36,7 @@ from GANDLF.utils import one_hot
 
 from openfl import load_yaml
 from openfl.models.pytorch import PyTorchFLModel
-from .losses import MCD_loss, DCCE, CE, MCD_MSE_loss, dice_loss, average_dice_over_channels
+from .losses import MCD_loss, DCCE, CE, MCD_MSE_loss, dice_loss, average_dice_over_channels, clinical_dice_loss, clinical_dice_log_loss, clinical_dice
 
 # TODO: Run in CONTINUE_LOCAL or RESET optimizer modes for now, later ensure that the cyclic learning rate is properly handled for CONTINUE_GLOBAL.
 # FIXME: do we really want to keep loss at 1-dice rather than -ln(dice)
@@ -56,17 +60,20 @@ def crop(array, slices):
     return array[tuple(slices)]
 
 
-def cyclical_lr(stepsize, min_lr, max_lr):
-    #Scaler : we can adapt this if we do not want the triangular LR
-    scaler = lambda x:1
-    #Lambda function to calculate the LR
-    lr_lambda = lambda it: max_lr - (max_lr - min_lr)*relative(it,stepsize)
-    #Additional function to see where on the cycle we are
-    def relative(it, stepsize):
-        cycle = math.floor(1+it/(2*stepsize))
-        x = abs(it/stepsize - 2*cycle + 1)
-        return max(0,(1-x))*scaler(cycle)
-    return lr_lambda
+def cyclical_lr(cycle_length, min_lr_multiplier, max_lr_multiplier):
+    # Lambda function to calculate what to multiply the inital learning rate by
+    # The beginning and end of the cycle result in highest multipliers (lowest at the center)
+    mult = lambda it: max_lr_multiplier * rel_dist(it, cycle_length) + min_lr_multiplier * (1 - rel_dist(it, cycle_length))
+    
+    def rel_dist(iteration, cycle_length):
+        # relative_distance from iteration to the center of the cycle
+        # equal to 1 at beggining of cycle and 0 right at the cycle center
+
+        # reduce the iteration to less than the cycle length
+        iteration = iteration % cycle_length
+        return 2 * abs(iteration - cycle_length/2.0) / cycle_length
+
+    return mult
 
 
 class BrainMaGeModel(PyTorchFLModel):
@@ -74,15 +81,18 @@ class BrainMaGeModel(PyTorchFLModel):
     def __init__(self, 
                  data, 
                  base_filters, 
-                 learning_rate, 
+                 min_learning_rate, 
+                 max_learning_rate,
+                 learning_rate_cycles_per_epoch,
                  loss_function, 
                  opt, 
                  device='cpu',
-                 n_classes=2,
+                 n_classes=4,
                  n_channels=4,
                  psize=[128,128,128],
                  smooth=1e-7,
-                 use_penalties=False,
+                 use_penalties=False, 
+                 infer_gandlf_images_with_cropping = False,
                  **kwargs):
         super().__init__(data=data, device=device, **kwargs)
         
@@ -104,9 +114,11 @@ class BrainMaGeModel(PyTorchFLModel):
         else:
             self.psize = psize
 
-        # setting parameters as attributes
-        # training parameters
-        self.learning_rate = learning_rate
+        # we currently have a hard coded triangular learning rate scheduler
+        self.min_learning_rate = min_learning_rate
+        self.max_learning_rate = max_learning_rate
+        self.learning_rate_cycles_per_epoch = learning_rate_cycles_per_epoch
+
         self.which_loss = loss_function
         self.opt = opt
         # model parameters
@@ -119,6 +131,11 @@ class BrainMaGeModel(PyTorchFLModel):
         self.smooth = smooth
         self.which_model = self.__repr__()
         self.use_panalties = use_penalties
+
+        # used only when using the gandlf_data object
+        # (will we crop external zero-planes, infer, then pad output with zeros OR
+        #  get outputs for multiple patches - fusing the outputs)
+        self.infer_gandlf_images_with_cropping = infer_gandlf_images_with_cropping
         
         ############### CHOOSING THE LOSS FUNCTION ###################
         if self.which_loss == 'dc':
@@ -129,12 +146,14 @@ class BrainMaGeModel(PyTorchFLModel):
             self.loss_fn = CE
         elif self.which_loss == 'mse':
             self.loss_fn = MCD_MSE_loss
+        elif self.which_loss == 'cdl':
+            self.loss_fn = clinical_dice_loss
+        elif self.which_loss == 'cdll':
+            self.loss_fn = clinical_dice_log_loss
         else:
             raise ValueError('{} loss is not supported'.format(self.which_loss))
 
-        # TODO: remove print statements here
-        print("Computing channel keys and train paths.")
-        self.channel_keys, self.train_paths = self.get_channel_keys_and_train_paths()
+        self.channel_keys= self.get_channel_keys()
         
         self.dice_penalty_dict = None
         if self.use_panalties:
@@ -144,23 +163,36 @@ class BrainMaGeModel(PyTorchFLModel):
     def init_optimizer(self):
         if self.opt == 'sgd':
             self.optimizer = optim.SGD(self.parameters(),
-                                       lr= self.learning_rate,
+                                       lr= self.max_learning_rate,
                                        momentum = 0.9)
         if self.opt == 'adam':    
             self.optimizer = optim.Adam(self.parameters(), 
-                                        lr = self.learning_rate, 
+                                        lr = self.max_learning_rate, 
                                         betas = (0.9,0.999), 
                                         weight_decay = 0.00005)
 
-        # TODO: To sync learning rate cycle, we assume single epoch per round and that the data loader is allowing partial batches!!!
-        step_size = int(np.ceil(self.data.get_training_data_size()/self.data.batch_size))
-        if step_size == 0:
-            # This only happens when we have no training data so will not be using the optimizer
-            step_size = 1
-            print("\nNo training data is present, so cyclic optimizer being set with step size of 1.\n")
-        clr = cyclical_lr(step_size, min_lr = 0.000001, max_lr = 0.001)
+        # If this is removed, need to redo the cylce_length calculation below
+        assert self.data.batch_size == 1
+
+        # TODO: To sync learning rate cycle across collaborators, we assume each collaborator is training 
+        # a set fraction of an epoch (rather than a set number of batches) otherwise use batch_num based cycle length
+        cycle_length =  int(float(self.data.get_training_data_size()) / float(self.learning_rate_cycles_per_epoch))
+        if cycle_length == 0:
+            if self.data.get_training_data_size == 0:
+                cycle_length = 1
+                print("\nNo training data is present, so setting silly cyclic length for scheduler.\n")
+            else:
+                raise ValueError("learning_rate_cycles_per_epoch is set to {} which cannot be greater than the number of training samples (which is {}).".format(self.learning_rate_cycles_per_epoch, self.data.get_training_data_size()))
+
+        # inital learning rates (see above) are set to the max learning rate value
+        # scheduling is performed thereafter by multiplying the optimizer rates
+        min_lr_multiplier = float(self.min_learning_rate) / float(self.max_learning_rate)
+        max_lr_multiplier = 1.0
+        clr = cyclical_lr(cycle_length=cycle_length, 
+                          min_lr_multiplier = min_lr_multiplier, 
+                          max_lr_multiplier = max_lr_multiplier)
+        
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, [clr])
-        sys.stdout.flush()
     
     def reset_opt_vars(self, **kwargs):
         self.init_optimizer(**kwargs)
@@ -172,22 +204,20 @@ class BrainMaGeModel(PyTorchFLModel):
     def forward(self, x):
         raise NotImplementedError()
 
-    def get_channel_keys_and_train_paths(self):
-        # Getting the channels for training and removing all the non numeric entries from the channels
-        train_paths = []
+    def get_channel_keys(self):
+        # Getting one training subject
+        channel_keys = []
         for subject in self.data.get_train_loader():
-            # Example subject keys: ['0', '1', '2', '3', 'label', 'index_ini']
-            # Example subject['0'] keys are: ['data', 'affine', 'path', 'stem', 'type']
-            train_paths.append(subject['0']['path'])
+            # break
           
             # use last subject to inspect channel keys
-            channel_keys = []
+            # channel_keys = []
             for key in subject.keys():
                 if key.isnumeric():
                     channel_keys.append(key)
 
-            return channel_keys, train_paths
-        return None, None
+            return channel_keys
+        return channel_keys
 
     def prep_penalties(self):
 
@@ -213,21 +243,37 @@ class BrainMaGeModel(PyTorchFLModel):
                 currentNumber = torch.nonzero(one_hot_mask[:,i,:,:,:], as_tuple=False).size(0)
                 dice_weights_dict[i] = dice_weights_dict[i] + currentNumber # class-specific non-zero voxels
                 total_nonZeroVoxels = total_nonZeroVoxels + currentNumber # total number of non-zero voxels to be considered
-
+        
         if total_nonZeroVoxels == 0:
             raise RuntimeError('Trying to train on data where every label mask is background class only.')
 
-        # get the penalty values - dice_weights contains the overall number for each class in the training data
-        for i in range(1, self.n_classes):
-            penalty = total_nonZeroVoxels # start with the assumption that all the non-zero voxels make up the penalty
-            for j in range(1, self.n_classes):
-                if i != j: # for differing classes, subtract the number
-                    penalty = penalty - dice_penalty_dict[j]
-            
-            dice_penalty_dict[i] = penalty / total_nonZeroVoxels # this is to be used to weight the loss function
-        dice_weights_dict[i] = 1 - dice_weights_dict[i]# this can be used for weighted averaging
+        # dice_weights_dict_temp = deepcopy(dice_weights_dict)
+        dice_weights_dict = {k: (v / total_nonZeroVoxels) for k, v in dice_weights_dict.items()} # divide each dice value by total nonzero
+        dice_penalty_dict = deepcopy(dice_weights_dict) # deep copy so that both values are preserved
+        dice_penalty_dict = {k: 1 - v for k, v in dice_weights_dict.items()} # subtract from 1 for penalty
+        total = sum(dice_penalty_dict.values())
+        dice_penalty_dict = {k: v / total for k, v in dice_penalty_dict.items()} # normalize penalty to ensure sum of 1
+        # dice_penalty_dict = get_class_imbalance_weights(trainingDataFromPickle, parameters, headers, is_regression, class_list) # this doesn't work because ImagesFromDataFrame gets import twice, causing a "'module' object is not callable" error
 
         return dice_weights_dict, dice_penalty_dict
+
+    def infer_batch_with_no_numpy_conversion(self, features, **kwargs):
+        """Very similar to base model infer_batch, but does not
+           explicitly convert the output to numpy.
+           Run inference on a batch
+        Args:
+            features: Input for batch
+        Gets the outputs for the inputs provided.
+        """
+
+        device = torch.device(self.device)
+        self.eval()
+
+        with torch.no_grad():
+            features = features.to(device)
+            output = self(features.float())
+            output = output.cpu()
+        return output
 
     def train_batches(self, num_batches, use_tqdm=False):
         num_subjects = num_batches
@@ -258,18 +304,20 @@ class BrainMaGeModel(PyTorchFLModel):
         if use_tqdm:
             train_loader = tqdm.tqdm(train_loader, desc="training for this round")
 
-        total_round_training_loss = 0
+        total_loss = 0
         subject_num = 0
+        num_nan_losses = 0
 
         # set to "training" mode
         self.train()
         while subject_num < num_subjects:
                        
-            total_loss = 0
             for subject in train_loader:
                 if subject_num >= num_subjects:
                     break
                 else:
+                    if device.type == 'cuda':
+                        print('=== Memory (allocated; cached) : ', round(torch.cuda.memory_allocated(0)/1024**3, 1), '; ', round(torch.cuda.memory_reserved(0)/1024**3, 1))
                     # Load the subject and its ground truth
                     # this is when we are using pt_brainmagedata
                     if ('features' in subject.keys()) and ('gt' in subject.keys()):
@@ -280,18 +328,14 @@ class BrainMaGeModel(PyTorchFLModel):
                         features = torch.cat([subject[key][torchio.DATA] for key in self.channel_keys], dim=1)
                         mask = subject['label'][torchio.DATA]
 
-                        # TODO: temporarily patching here (should be done in loader instead)
-                        slices = random_slices(mask, self.data.psize)
-                        mask = crop(mask, slices=slices)
-                        # for the feature array, we skip the first axis as it enumerates the modalities
-                        features = crop(features, slices=slices)
+                    print("\n\nTrain features with shape: {}\n".format(features.shape))
 
-                        mask = one_hot(mask, self.data.class_list)
+                    mask = one_hot(mask, self.data.class_list)
                         
                     # Loading features into device
                     features, mask = features.float().to(device), mask.float().to(device)
-                    # TODO: Variable class is deprecated - parameteters to be given are the tensor, whether it requires grad and the function that created it   
-                    features, mask = Variable(features, requires_grad = True), Variable(mask, requires_grad = True)
+                    # TODO: Variable class is deprecated - parameters to be given are the tensor, whether it requires grad and the function that created it   
+                    # features, mask = Variable(features, requires_grad = True), Variable(mask, requires_grad = True)
                     # Making sure that the optimizer has been reset
                     self.optimizer.zero_grad()
                     # Forward Propagation to get the output from the models
@@ -301,14 +345,17 @@ class BrainMaGeModel(PyTorchFLModel):
                     
                     output = self(features.float())
                     # Computing the loss
-                    loss = self.loss_fn(output.double(), mask.double(),num_class=self.label_channels, weights=self.dice_penalty_dict)
-                    # Back Propagation for model to learn
-                    loss.backward()
-                    #Updating the weight values
-                    self.optimizer.step()
-                    #Pushing the dice to the cpu and only taking its value
-                    loss.cpu().data.item()
-                    total_loss += loss
+                    loss = self.loss_fn(output.float(), mask.float(),num_classes=self.label_channels, weights=self.dice_penalty_dict, class_list=self.data.class_list)
+                    # Back Propagation for model to learn (unless loss is nan)
+                    if torch.isnan(loss):
+                        num_nan_losses += 1
+                    else:
+                        loss.backward()
+                        #Updating the weight values
+                        self.optimizer.step()
+                        #Pushing the dice to the cpu and only taking its value
+                        loss.cpu().data.item()
+                        total_loss += loss
                     self.lr_scheduler.step()
 
                     # TODO: Not recommended? (https://discuss.pytorch.org/t/about-torch-cuda-empty-cache/34232/6)will try without
@@ -316,13 +363,14 @@ class BrainMaGeModel(PyTorchFLModel):
 
                     subject_num += 1
 
-            total_round_training_loss += total_loss
-        # we return the average batch loss over all epochs trained this round
-        return total_round_training_loss / num_subjects
+        num_subject_grads = num_subjects - num_nan_losses
+
+        # we return the average batch loss over all epochs trained this round (excluding the nan results)
+        # we also return the number of samples that produced nan losses, as well as total samples used
+        # FIXME: In a federation we may want the collaborators data size to be modified when backprop is skipped.
+        return {"loss": total_loss / num_subject_grads, "num_nan_losses": num_nan_losses, "num_samples_used": num_subjects }
 
     def validate(self, use_tqdm=False):
-        device = torch.device(self.device)       
-        self.eval()
         
         total_dice = 0
         
@@ -335,28 +383,38 @@ class BrainMaGeModel(PyTorchFLModel):
             val_loader = tqdm.tqdm(val_loader, desc="validate")
 
         for subject in val_loader:
-            with torch.no_grad():
-                # this is when we are using pt_brainmagedata
-                if ('features' in subject.keys()) and ('gt' in subject.keys()):
-                    features = subject['features']
-                    mask = subject['gt']
-                # this is when we are using gandlf loader   
-                else:
-                    features = torch.cat([subject[key][torchio.DATA] for key in self.channel_keys], dim=1)
-                    mask = subject['label'][torchio.DATA]
+            # this is when we are using pt_brainmagedata
+            if ('features' in subject.keys()) and ('gt' in subject.keys()):
+                features = subject['features']
+                mask = subject['gt']
+        
+                output = self.infer_batch_with_no_numpy_conversion(features=features)
+                    
+            # using the gandlf loader   
+            else:
+                features = torch.cat([subject[key][torchio.DATA] for key in self.channel_keys], dim=1)
+                mask = subject['label'][torchio.DATA]
 
-                    # TODO: temporarily patching here (should support through the loader instead)
-                    slices = random_slices(mask, self.data.psize)
-                    mask = crop(mask, slices=slices)
-                    # for the feature array, we skip the first axis as it enumerates the modalities
-                    features = crop(features, slices=slices)
+                if self.infer_gandlf_images_with_cropping:
+                    output = self.data.infer_with_crop(model_inference_function=[self.infer_batch_with_no_numpy_conversion], 
+                                                        features=features)
+                else:
+                    output = self.data.infer_with_crop_and_patches(model_inference_function=[self.infer_batch_with_no_numpy_conversion], 
+                                                                    features=features)
+
                     
-                    mask = one_hot(mask, self.data.class_list)
-                    
-                features, mask = features.to(device), mask.to(device)
-                output = self(features.float())
-                curr_dice = average_dice_over_channels(output.double(), mask.double(), self.binary_classification).cpu().data.item()
-                total_dice += curr_dice
+                
+            # one-hot encoding of ground truth
+            mask = one_hot(mask, self.data.class_list)
+            
+            # sanity check that the output and mask have the same shape
+            if output.shape != mask.shape:
+                raise ValueError('Model output and ground truth mask are not the same shape.')
+
+            # curr_dice = average_dice_over_channels(output.float(), mask.float(), self.binary_classification).cpu().data.item()
+            curr_dice = clinical_dice(output.float(), mask.float(), class_list=self.data.class_list).cpu().data.item()
+            total_dice += curr_dice
+                
         #Computing the average dice
         average_dice = total_dice/len(val_loader)
 
